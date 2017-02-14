@@ -39,24 +39,33 @@ using BOUND = optional<std::pair<int64_t,int64_t> >;
 
 
 struct BoundValue {
+private:
+	std::pair<float, BOUND> predicateBound(int64_t value,
+		llvm::CmpInst::Predicate pred,
+		const BoundValue* prevState) const;
+public:
 	BOUND range; // undefined by default
-	// todo: use range_entropy for widening, and updated during meet and transfer
+	// use range_entropy for widening, and updated during meet and transfer
 	float range_entropy = 0.0;
 	// retain type in order to better approximate error bounds
 	Type* boundType = nullptr;
 
 	BoundValue() {}
 
-	explicit BoundValue(llvm::Constant* value,
+	BoundValue(llvm::Constant* value,
 		llvm::CmpInst::Predicate pred = llvm::CmpInst::ICMP_EQ,
 		const BoundValue* prevState = nullptr);
 
-	explicit BoundValue(BOUND range, Type* boundType);
+	BoundValue(const BoundValue& other,
+		llvm::CmpInst::Predicate pred = llvm::CmpInst::ICMP_EQ,
+		const BoundValue* prevState = nullptr);
 
-	explicit BoundValue(const BoundValue& v,
+	BoundValue(BOUND range, Type* boundType);
+
+	BoundValue(const BoundValue& v,
 		std::function<optional<int64_t>(int64_t,Type*)> eval);
 
-	explicit BoundValue(const BoundValue& v1, const BoundValue& v2,
+	BoundValue(const BoundValue& v1, const BoundValue& v2,
 		std::function<optional<int64_t>(int64_t,int64_t,Type*)> eval);
 
 	BoundValue
@@ -71,6 +80,11 @@ struct BoundValue {
 	bool
 	isInf() const {
 		return range && NEGINF == range->first && INF == range->second;
+	}
+
+	void
+	makeTop() {
+		range = BOUND({NEGINF, INF});
 	}
 };
 
@@ -98,7 +112,6 @@ struct BoundInfo {
 	static bool isEqual(const BoundValue& lhs, const BoundValue& rhs) {
 		if (lhs.hasRange() == rhs.hasRange()) {
 			if (lhs.hasRange()) {
-				// todo: approximate bounds by defining an error threshold scaling with value bit size
 				return lhs.range->first == rhs.range->first && lhs.range->second == rhs.range->second;
 			}
 			else {

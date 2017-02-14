@@ -12,6 +12,8 @@ static std::mt19937 gen(rd());
 static std::uniform_real_distribution<float> rando(0, 1);
 
 void widen (BoundValue& bv) {
+	assert(false == isnan(bv.range_entropy));
+
 	if (!bv.isInf()) {
 		unsigned interval = bv.range->second - bv.range->first+1;
 		unsigned milestone = interval / 256;
@@ -22,15 +24,14 @@ void widen (BoundValue& bv) {
 		// we want to encourage range approximation, for faster convergence
 		// set ad hoc threshold of 0.5 entropy
 		else if (bv.range_entropy < 0.5) {
-			double totalgrowth = 0;
-			double growth = interval/2;
-			for (size_t i = 0; i < milestone; i++) {
-				growth = std::log(growth);
-				bv.range->second += growth;
-				bv.range->first -= growth;
-				totalgrowth += 2*growth;
+			if (milestone >= 1) {
+				double growth = std::log(interval/2);
+				for (size_t i = 0; i < milestone; i++) {
+					bv.range->second += growth;
+					bv.range->first -= growth;
+				}
+				bv.range_entropy *= 1.0 + (milestone * growth / interval);
 			}
-			bv.range_entropy *= 1.0 + (totalgrowth / interval);
 		}
 	}
 }
@@ -45,6 +46,66 @@ unsigned getOverlap(BOUND interv1, BOUND interv2) {
 }
 
 
+std::pair<float, BOUND> BoundValue::predicateBound(int64_t value,
+	llvm::CmpInst::Predicate pred,
+	const BoundValue* prevState) const {
+	int64_t lower = NEGINF;
+	int64_t upper = INF;
+	float potential_entropy = rando(gen);
+	BOUND fbound;
+
+	if (prevState != nullptr && prevState->range) {
+		lower = prevState->range->first;
+		upper = prevState->range->second;
+		potential_entropy += prevState->range_entropy;
+		potential_entropy /= 2;
+	}
+
+	switch (pred) {
+		case llvm::CmpInst::FCMP_OEQ:
+		case llvm::CmpInst::FCMP_UEQ:
+		case llvm::CmpInst::ICMP_EQ:
+			fbound = BOUND({value, value});
+			potential_entropy = range_entropy;
+			break;
+
+			// for ranges with undefined upper or lower bound, assign noise to simulate
+			// random default value of variable
+		case llvm::CmpInst::FCMP_OLT:
+		case llvm::CmpInst::FCMP_ULT:
+		case llvm::CmpInst::ICMP_ULT:
+		case llvm::CmpInst::ICMP_SLT:
+			fbound = BOUND({lower, value-1});
+			break;
+
+		case llvm::CmpInst::FCMP_OLE:
+		case llvm::CmpInst::FCMP_ULE:
+		case llvm::CmpInst::ICMP_ULE:
+		case llvm::CmpInst::ICMP_SLE:
+			fbound = BOUND({lower, value});
+			break;
+
+		case llvm::CmpInst::FCMP_OGT:
+		case llvm::CmpInst::FCMP_UGT:
+		case llvm::CmpInst::ICMP_UGT:
+		case llvm::CmpInst::ICMP_SGT:
+			fbound = BOUND({value+1, upper});
+			break;
+
+		case llvm::CmpInst::FCMP_OGE:
+		case llvm::CmpInst::FCMP_UGE:
+		case llvm::CmpInst::ICMP_UGE:
+		case llvm::CmpInst::ICMP_SGE:
+			fbound = BOUND({value, upper});
+			break;
+
+		default:
+			break;
+	}
+	return {potential_entropy, fbound};
+}
+
+
 BoundValue::BoundValue(llvm::Constant* value,
 	llvm::CmpInst::Predicate pred,
 	const BoundValue* prevState)
@@ -52,64 +113,29 @@ BoundValue::BoundValue(llvm::Constant* value,
 {
 	if (auto* constint = dyn_cast<ConstantInt>(value)) {
 		int64_t val = constint->getSExtValue();
-
-		int64_t lower = NEGINF;
-		int64_t upper = INF;
-		float potential_entropy = rando(gen);
-
-		if (prevState != nullptr && prevState->range) {
-			lower = prevState->range->first;
-			upper = prevState->range->second;
-			potential_entropy += prevState->range_entropy;
-			potential_entropy /= 2;
-		}
-
-		switch (pred) {
-			case llvm::CmpInst::FCMP_OEQ:
-			case llvm::CmpInst::FCMP_UEQ:
-			case llvm::CmpInst::ICMP_EQ:
-				range = BOUND({val, val});
-				break;
-
-			// for ranges with undefined upper or lower bound, assign noise to simulate
-			// random default value of variable
-			case llvm::CmpInst::FCMP_OLT:
-			case llvm::CmpInst::FCMP_ULT:
-			case llvm::CmpInst::ICMP_ULT:
-			case llvm::CmpInst::ICMP_SLT:
-				range = BOUND({lower, val-1});
-				range_entropy = potential_entropy;
-				break;
-
-			case llvm::CmpInst::FCMP_OLE:
-			case llvm::CmpInst::FCMP_ULE:
-			case llvm::CmpInst::ICMP_ULE:
-			case llvm::CmpInst::ICMP_SLE:
-				range = BOUND({lower, val});
-				range_entropy = potential_entropy;
-				break;
-
-			case llvm::CmpInst::FCMP_OGT:
-			case llvm::CmpInst::FCMP_UGT:
-			case llvm::CmpInst::ICMP_UGT:
-			case llvm::CmpInst::ICMP_SGT:
-				range = BOUND({val+1, upper});
-				range_entropy = potential_entropy;
-				break;
-
-			case llvm::CmpInst::FCMP_OGE:
-			case llvm::CmpInst::FCMP_UGE:
-			case llvm::CmpInst::ICMP_UGE:
-			case llvm::CmpInst::ICMP_SGE:
-				range = BOUND({val, upper});
-				range_entropy = potential_entropy;
-				break;
-
-			default:
-				break;
-		}
+		std::pair<float, BOUND> p = predicateBound(val, pred, prevState);
+		range_entropy = p.first;
+		range = p.second;
+		widen(*this);
 	}
-	widen(*this);
+}
+
+BoundValue::BoundValue(const BoundValue& other,
+	llvm::CmpInst::Predicate pred,
+	const BoundValue* prevState)
+	: boundType(other.boundType)
+{
+	if (other.range) {
+		std::pair<float, BOUND> p = predicateBound(other.range->first, pred, prevState);
+		std::pair<float, BOUND> p2 = predicateBound(other.range->second, pred, prevState);
+
+		range_entropy = (p.first + p2.first) / 2;
+		range = BOUND({
+			std::min(p.second->first, p2.second->first),
+			std::max(p.second->second, p2.second->second)
+		});
+		widen(*this);
+	}
 }
 
 BoundValue::BoundValue(BOUND range, Type* boundType) : range(range), boundType(boundType) {
@@ -293,7 +319,8 @@ struct ErrReport {
 
 
 static llvm::DenseSet<ErrReport*> errorLog;
-static llvm::DenseMap<llvm::Value*, ErrReport*> potentialError;
+// encode context for call depth of 2 todo: generalize
+static std::unordered_map<unsigned, llvm::DenseMap<llvm::Value*, ErrReport*> > potentialError;
 
 
 static BOUND
@@ -324,6 +351,16 @@ checkError(Value* idx, signed limit, BoundState& state) {
 }
 
 
+static unsigned
+contextEncode(std::vector<unsigned>& context) {
+	unsigned total = 0;
+	for (size_t i = 0; i < context.size(); i++) {
+		total += (i+1) * context[i] % massivePrime;
+	}
+	return total;
+}
+
+
 void
 BoundTransfer::operator()(llvm::Instruction& i, BoundState& state, std::vector<unsigned>& context) {
 	// error check instruction
@@ -340,19 +377,19 @@ BoundTransfer::operator()(llvm::Instruction& i, BoundState& state, std::vector<u
 			b->second *= byteWidth.back();
 			if (lineno) {
 				// cache this as potential error, wrt to i, then log if and only if there is a store/read on instruction i
-				potentialError.insert({gep, new ErrReport{ i.getFunction(), context, lineno.value(), limit, b }});
+				potentialError[contextEncode(context)].insert({gep, new ErrReport{ i.getFunction(), context, lineno.value(), limit, b }});
 			}
 		}
 	}
 	else if (LoadInst* getter = llvm::dyn_cast<llvm::LoadInst>(&i)) {
-		auto gpair = potentialError.find(getter->getPointerOperand());
-		if (potentialError.end() != gpair) {
+		auto gpair = potentialError[contextEncode(context)].find(getter->getPointerOperand());
+		if (potentialError[contextEncode(context)].end() != gpair) {
 			errorLog.insert(gpair->second);
 		}
 	}
 	else if (StoreInst* setter = llvm::dyn_cast<llvm::StoreInst>(&i)) {
-		auto spair = potentialError.find(setter->getPointerOperand());
-		if (potentialError.end() != spair) {
+		auto spair = potentialError[contextEncode(context)].find(setter->getPointerOperand());
+		if (potentialError[contextEncode(context)].end() != spair) {
 			errorLog.insert(spair->second);
 		}
 	}

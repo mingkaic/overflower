@@ -1,8 +1,6 @@
 
 #ifndef DATAFLOW_ANALYSIS_H
 #define DATAFLOW_ANALYSIS_H
-// todo: remove
-#include <iostream>
 
 #include <deque>
 #include <numeric>
@@ -16,6 +14,9 @@
 #include "llvm/IR/InstIterator.h"
 
 #include "utils.h"
+
+
+const unsigned long massivePrime = 32452657; // todo: randomly generate?
 
 
 namespace analysis {
@@ -72,9 +73,6 @@ using DataflowResult =
   llvm::DenseMap<llvm::Value*, AbstractState<AbstractValue>>;
 
 
-const unsigned long massivePrime = 32452657; // todo: randomly generate later?
-
-
 template <typename AbstractValue, typename AbstractInfo>
 struct ArgInfo {
   static inline std::vector<AbstractValue> getEmptyKey() {
@@ -91,7 +89,7 @@ struct ArgInfo {
 
     unsigned total = 0;
     for (size_t i = 0; i < setHash.size(); i++) {
-      total = (total + i * setHash[i]) % massivePrime;
+      total = (total + (i+1) * setHash[i]) % massivePrime;
     }
     return total;
   }
@@ -268,6 +266,9 @@ public:
     llvm::ReversePostOrderTraversal<llvm::Function*> rpot(&f);
     WorkList work(rpot.begin(), rpot.end());
 
+    std::unordered_map<llvm::CmpInst*, State> inverses;
+    std::unordered_map<llvm::BasicBlock*, State> blockInversion;
+
     while (!work.empty()) {
       auto* bb = work.take();
 
@@ -277,6 +278,14 @@ public:
 
       // Merge the state coming in from all predecessors
       auto state = mergeStateFromPredecessors(bb, results);
+
+      // take the inverse of values if this block is an else block or exit block (exits will phi regardless)
+      const auto candidateInversion = blockInversion.find(bb);
+      if (blockInversion.end() != candidateInversion) {
+        for (auto valuePair : candidateInversion->second) {
+          state[valuePair.first] = valuePair.second;
+        }
+      }
 
       // If we have already processed the block and no changes have been made to
       // the abstract input, we can skip processing the block. Otherwise, save
@@ -291,6 +300,7 @@ public:
       }
 
       bool boundChecked = false;
+      inverses.clear();
 
       // Propagate through all instructions in the block
       for (auto& i : *bb) {
@@ -331,7 +341,8 @@ public:
               }
             }
             else {
-              // todo: define summaries[func][argav] as Top to differentiate errors in function
+              // define summaries[func][argav] as Top to differentiate errors in function
+              summaries[func][argav].makeTop();
             }
           }
           state[call] = summaries[func][argav];
@@ -358,27 +369,46 @@ public:
 
           llvm::Constant* lc = llvm::dyn_cast<llvm::Constant>(lhs);
           llvm::Constant* rc = llvm::dyn_cast<llvm::Constant>(rhs);
-          if (lc && rc) continue; // ok...
+          if (lc && rc) continue; // comparing 2 constants... ok...
 
           auto ldep = state.find(lhs);
           auto rdep = state.find(rhs);
 
-          // todo: deduce lhs or rhs intervals to preserve variable abstraction in successor blocks
+          // deduce lhs or rhs intervals to preserve variable abstraction in successor blocks
           if ((state.end() != ldep && state.end() != rdep) ||
               (nullptr == lc && nullptr == rc)) {
+            state[ldep->first] = AbstractValue(rdep->second, comp->getPredicate(), &ldep->second);
+            state[rdep->first] = AbstractValue(ldep->second, comp->getPredicate(), &rdep->second);
 
+            // inverses
+            inverses[comp][ldep->first] = AbstractValue(rdep->second, comp->getInversePredicate(), &ldep->second);
+            inverses[comp][rdep->first] = AbstractValue(ldep->second, comp->getInversePredicate(), &rdep->second);
           }
           // define states for true block
           else if (state.end() != ldep && rc) {
             state[ldep->first] = AbstractValue(rc, comp->getPredicate(), &ldep->second);
+
+            inverses[comp][ldep->first] = AbstractValue(rc, comp->getInversePredicate(), &ldep->second);
           }
           else if (state.end() != rdep && lc) {
             state[rdep->first] = AbstractValue(lc, comp->getPredicate(), &rdep->second);
+
+            inverses[comp][rdep->first] = AbstractValue(lc, comp->getInversePredicate(), &rdep->second);
           }
         }
         else if (llvm::BranchInst* br = llvm::dyn_cast<llvm::BranchInst>(&i)) {
-          if (br->isConditional() && state.end() == state.find(br->getCondition())) {
-            boundChecked = true; // continue to the next block, since we have the condition variable's bounds already set
+          if (br->isConditional()) {
+            llvm::Value* cond = br->getCondition();
+            if (state.end() == state.find(cond)) {
+              boundChecked = true; // continue to the next block, since we have the condition variable's bounds already set
+
+              if (br->getNumSuccessors() > 1) {
+                if (llvm::CmpInst *cmp = llvm::dyn_cast<llvm::CmpInst>(cond)) {
+                  llvm::BasicBlock *ibb = br->getSuccessor(1);
+                  blockInversion[ibb] = inverses[cmp];
+                }
+              }
+            }
           }
         }
         else {
@@ -387,18 +417,6 @@ public:
         results[&i] = state;
       }
 
-// todo: remove
-//      std::cout << "==============" << bb << "==============\n";
-//      for (auto spair: state) {
-//        std::cout << spair.first << " ";
-//        if (spair.second.range) {
-//          std::cout << spair.second.range->first << ":"
-//                  << spair.second.range->second << "\n";
-//        }
-//        else {
-//          std::cout << "undefined\n";
-//        }
-//      }
 
       // If the abstract state for this block did not change, then we are done
       // with this block. Otherwise, we must update the abstract state and
