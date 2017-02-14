@@ -373,27 +373,30 @@ public:
 
           auto ldep = state.find(lhs);
           auto rdep = state.find(rhs);
+          llvm::CmpInst::Predicate main = comp->getPredicate();
+          llvm::CmpInst::Predicate other = comp->getInversePredicate(comp->getPredicate());
 
           // deduce lhs or rhs intervals to preserve variable abstraction in successor blocks
           if ((state.end() != ldep && state.end() != rdep) ||
               (nullptr == lc && nullptr == rc)) {
-            state[ldep->first] = AbstractValue(rdep->second, comp->getPredicate(), &ldep->second);
-            state[rdep->first] = AbstractValue(ldep->second, comp->getPredicate(), &rdep->second);
+            state[ldep->first] = AbstractValue(rdep->second, main, &ldep->second);
+            state[rdep->first] = AbstractValue(ldep->second, main, &rdep->second);
 
             // inverses
-            inverses[comp][ldep->first] = AbstractValue(rdep->second, comp->getInversePredicate(), &ldep->second);
-            inverses[comp][rdep->first] = AbstractValue(ldep->second, comp->getInversePredicate(), &rdep->second);
+            inverses[comp][ldep->first] = AbstractValue(rdep->second, other, &ldep->second);
+            inverses[comp][rdep->first] = AbstractValue(ldep->second, other, &rdep->second);
           }
           // define states for true block
           else if (state.end() != ldep && rc) {
-            state[ldep->first] = AbstractValue(rc, comp->getPredicate(), &ldep->second);
+            state[ldep->first] = AbstractValue(rc, main, &ldep->second);
 
-            inverses[comp][ldep->first] = AbstractValue(rc, comp->getInversePredicate(), &ldep->second);
+            inverses[comp][ldep->first] = AbstractValue(rc, other, &ldep->second);
           }
           else if (state.end() != rdep && lc) {
-            state[rdep->first] = AbstractValue(lc, comp->getPredicate(), &rdep->second);
 
-            inverses[comp][rdep->first] = AbstractValue(lc, comp->getInversePredicate(), &rdep->second);
+            state[rdep->first] = AbstractValue(lc, main, &rdep->second);
+
+            inverses[comp][rdep->first] = AbstractValue(lc, other, &rdep->second);
           }
         }
         else if (llvm::BranchInst* br = llvm::dyn_cast<llvm::BranchInst>(&i)) {

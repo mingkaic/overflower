@@ -51,7 +51,7 @@ std::pair<float, BOUND> BoundValue::predicateBound(int64_t value,
 	const BoundValue* prevState) const {
 	int64_t lower = NEGINF;
 	int64_t upper = INF;
-	float potential_entropy = rando(gen);
+	float potential_entropy = rando(gen) / 2;
 	BOUND fbound;
 
 	if (prevState != nullptr && prevState->range) {
@@ -75,6 +75,11 @@ std::pair<float, BOUND> BoundValue::predicateBound(int64_t value,
 		case llvm::CmpInst::FCMP_ULT:
 		case llvm::CmpInst::ICMP_ULT:
 		case llvm::CmpInst::ICMP_SLT:
+			{
+				if (lower > value) {
+					lower = NEGINF;
+				}
+			}
 			fbound = BOUND({lower, value-1});
 			break;
 
@@ -82,6 +87,11 @@ std::pair<float, BOUND> BoundValue::predicateBound(int64_t value,
 		case llvm::CmpInst::FCMP_ULE:
 		case llvm::CmpInst::ICMP_ULE:
 		case llvm::CmpInst::ICMP_SLE:
+			{
+				if (lower > value) {
+					lower = NEGINF;
+				}
+			}
 			fbound = BOUND({lower, value});
 			break;
 
@@ -89,6 +99,11 @@ std::pair<float, BOUND> BoundValue::predicateBound(int64_t value,
 		case llvm::CmpInst::FCMP_UGT:
 		case llvm::CmpInst::ICMP_UGT:
 		case llvm::CmpInst::ICMP_SGT:
+			{
+				if (upper < value) {
+					upper = INF;
+				}
+			}
 			fbound = BOUND({value+1, upper});
 			break;
 
@@ -96,10 +111,16 @@ std::pair<float, BOUND> BoundValue::predicateBound(int64_t value,
 		case llvm::CmpInst::FCMP_UGE:
 		case llvm::CmpInst::ICMP_UGE:
 		case llvm::CmpInst::ICMP_SGE:
+			{
+				if (upper < value) {
+					upper = INF;
+				}
+			}
 			fbound = BOUND({value, upper});
 			break;
 
 		default:
+			fbound = BOUND({NEGINF, INF});
 			break;
 	}
 	return {potential_entropy, fbound};

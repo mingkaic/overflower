@@ -1,5 +1,4 @@
 
-
 int
 foo(int c, int a, int b) {
   unsigned buffer[20] = {
