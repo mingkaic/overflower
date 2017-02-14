@@ -14,9 +14,9 @@
 #   make clean
 #
 
-OVERFLOWER   := ../../overflowerbuild/bin/overflower
-LLVM_PATH    :=
-CLANG        := $(LLVM_PATH)clang
+OVERFLOWER   := ../cmake-build-debug/bin/overflower
+LLVM_PATH    := /Users/cmk/llvm/bin/
+CLANG        := $(LLVM_PATH)clang-3.9
 OPT          := $(LLVM_PATH)opt
 RM           := /bin/rm
 SOURCE_FILES := $(sort $(wildcard c/*.c))
@@ -33,7 +33,7 @@ ll/%.ll: c/%.c
 	$(CLANG) -g -emit-llvm -S $< -o - | $(OPT) -mem2reg -S -o $@
 
 csv/%.csv: ll/%.ll
-	$(OVERFLOWER) $< > $@.csv
+	$(OVERFLOWER) $< > $@
 
 clean:
 	$(RM) -f $(CSV_FILES)

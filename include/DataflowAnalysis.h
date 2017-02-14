@@ -1,9 +1,12 @@
 
 #ifndef DATAFLOW_ANALYSIS_H
 #define DATAFLOW_ANALYSIS_H
+// todo: remove
+#include <iostream>
 
 #include <deque>
 #include <numeric>
+#include <unordered_map>
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -11,6 +14,8 @@
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstIterator.h"
+
+#include "utils.h"
 
 
 namespace analysis {
@@ -65,6 +70,46 @@ using AbstractState = llvm::DenseMap<llvm::Value*,AbstractValue>;
 template <typename AbstractValue>
 using DataflowResult =
   llvm::DenseMap<llvm::Value*, AbstractState<AbstractValue>>;
+
+
+const unsigned long massivePrime = 32452657; // todo: randomly generate later?
+
+
+template <typename AbstractValue, typename AbstractInfo>
+struct ArgInfo {
+  static inline std::vector<AbstractValue> getEmptyKey() {
+    return {AbstractInfo::getEmptyKey()};
+  }
+  static inline std::vector<AbstractValue> getTombstoneKey() {
+    return {AbstractInfo::getTombstoneKey()};
+  }
+  static unsigned getHashValue(const std::vector<AbstractValue>& Args) {
+    std::vector<unsigned> setHash;
+    for (AbstractValue av : Args) {
+      setHash.push_back(AbstractInfo::getHashValue(av));
+    }
+
+    unsigned total = 0;
+    for (size_t i = 0; i < setHash.size(); i++) {
+      total = (total + i * setHash[i]) % massivePrime;
+    }
+    return total;
+  }
+  static bool isEqual(const std::vector<AbstractValue>& lhs, const std::vector<AbstractValue>& rhs) {
+    return std::equal(lhs.begin(), lhs.end(), rhs.begin(),
+    [](const AbstractValue& av1, const AbstractValue& av2) {
+      return AbstractInfo::isEqual(av1, av2);
+    });
+  }
+};
+
+
+template <typename AbstractValue, typename AbstractInfo>
+using Arg2Ret = llvm::DenseMap<std::vector<AbstractValue>,AbstractValue,ArgInfo<AbstractValue, AbstractInfo> >;
+
+
+template <typename AbstractValue, typename AbstractInfo>
+using Summary = llvm::DenseMap<llvm::Function*,Arg2Ret<AbstractValue, AbstractInfo> >;
 
 
 template <typename AbstractValue>
@@ -144,6 +189,7 @@ private:
   // analysis basis.
   Meet meet;
   Transfer transfer;
+  std::vector<unsigned> context;
 
   State
   mergeStateFromPredecessors(llvm::BasicBlock* bb, Result& results) {
@@ -177,6 +223,9 @@ private:
       if (state.end() != found) {
         phiValue = meet({phiValue, found->second});
       }
+      else if (llvm::Constant* c = llvm::dyn_cast<llvm::Constant>(value.get())) {
+        phiValue = meet({phiValue, AbstractValue(c)});
+      }
     }
     return phiValue;
   }
@@ -186,18 +235,33 @@ private:
     // All phis are explicit meet operations
     if (auto* phi = llvm::dyn_cast<llvm::PHINode>(&i)) {
       state[phi] = meetOverPHI(state, *phi);
-    } else {
-      transfer(i, state);
+    }
+    else {
+      transfer(i, state, context);
     }
   }
 
 public:
+  ForwardDataflowAnalysis (std::vector<unsigned> callsites = {}) : context(callsites) {}
+
+  template <typename AbInfo>
   DataflowResult<AbstractValue>
-  computeForwardDataflow(llvm::Function& f) {
+  computeForwardDataflow(Summary<AbstractValue, AbInfo>& summaries, llvm::Function& f, std::vector<AbstractValue>& Args) {
     // First compute the initial outgoing state of all instructions
     Result results;
     for (auto& i : llvm::instructions(f)) {
       results.FindAndConstruct(&i);
+    }
+
+    // Associate function arguments with aggregate abstraction
+    llvm::Function::arg_iterator arg = f.arg_begin();
+    State ogState;
+    for (size_t i = 0; i < Args.size() && arg != f.arg_end(); i++) {
+      llvm::Value* v = dynamic_cast<llvm::Value*>(&*arg);
+      if (v) {
+        ogState[v] = Args[i];
+      }
+      arg++;
     }
 
     // Add all blocks to the worklist in topological order for efficiency
@@ -221,17 +285,125 @@ public:
         continue;
       }
       results[bb] = state;
+      for (auto oparam : ogState) {
+        if (state.end() != state.find(oparam.first)) break;
+        state[oparam.first] = oparam.second;
+      }
+
+      bool boundChecked = false;
 
       // Propagate through all instructions in the block
       for (auto& i : *bb) {
-        applyTransfer(i, state);
+        if (auto* call = llvm::dyn_cast<llvm::CallInst>(&i)) {
+          llvm::Function* func = call->getCalledFunction();
+          if (func->isDeclaration()) {
+          	continue;
+          }
+          unsigned nargs = call->getNumArgOperands();
+          std::vector<AbstractValue> argav;
+          for (unsigned i = 0; i < nargs; i++) {
+            llvm::Value* a = call->getOperand(i);
+            auto possibleState = state.find(a);
+            if (state.end() != possibleState) {
+              argav.push_back(possibleState->second);
+            }
+            else if (llvm::Constant* c = llvm::dyn_cast<llvm::Constant>(a)) {
+              argav.push_back(AbstractValue(c));
+            }
+            else { // not a constant, nor a stated variable, so it's undefined
+              argav.push_back(AbstractValue());
+            }
+          }
+          // push an undefined in if call has no arguments
+          if (argav.empty()) {
+            argav.push_back(AbstractValue());
+          }
+          if (summaries[func].end() == summaries[func].find(argav)) {
+            summaries[func][argav] = AbstractValue(); // default function return state to undefined in case of recursive calls
+            if (context.size() <= 2) { // fixed depth of 2 to bound for efficiency (todo: make main argument?)
+              // deeper analyze of func
+              optional<unsigned> callsiteno = getLineNumber(i);
+              if (callsiteno) { // only proceed if we have context info, otherwise don't proceed
+                std::vector<unsigned> concpy = context;
+                concpy.push_back(callsiteno.value());
+                ForwardDataflowAnalysis<AbstractValue, Transfer, Meet> analysis(concpy);
+                analysis.computeForwardDataflow<AbInfo>(summaries, *func, argav);
+              }
+            }
+            else {
+              // todo: define summaries[func][argav] as Top to differentiate errors in function
+            }
+          }
+          state[call] = summaries[func][argav];
+        }
+        else if (auto* ret = llvm::dyn_cast<llvm::ReturnInst>(&i)) {
+          llvm::Value* retv = ret->getReturnValue();
+          if (llvm::Constant* c = llvm::dyn_cast<llvm::Constant>(retv)) {
+            summaries[&f][Args] = AbstractValue(c);
+          }
+          else {
+            auto retav = state.find(retv);
+            if (state.end() == retav) {
+              summaries[&f][Args] = AbstractValue();
+            }
+            else {
+              summaries[&f][Args] = retav->second;
+            }
+          }
+        }
+        // control block analysis based on conditions and mapped bounds
+        else if (auto* comp = llvm::dyn_cast<llvm::CmpInst>(&i)) {
+          llvm::Value* lhs = comp->getOperand(0);
+          llvm::Value* rhs = comp->getOperand(1);
+
+          llvm::Constant* lc = llvm::dyn_cast<llvm::Constant>(lhs);
+          llvm::Constant* rc = llvm::dyn_cast<llvm::Constant>(rhs);
+          if (lc && rc) continue; // ok...
+
+          auto ldep = state.find(lhs);
+          auto rdep = state.find(rhs);
+
+          // todo: deduce lhs or rhs intervals to preserve variable abstraction in successor blocks
+          if ((state.end() != ldep && state.end() != rdep) ||
+              (nullptr == lc && nullptr == rc)) {
+
+          }
+          // define states for true block
+          else if (state.end() != ldep && rc) {
+            state[ldep->first] = AbstractValue(rc, comp->getPredicate(), &ldep->second);
+          }
+          else if (state.end() != rdep && lc) {
+            state[rdep->first] = AbstractValue(lc, comp->getPredicate(), &rdep->second);
+          }
+        }
+        else if (llvm::BranchInst* br = llvm::dyn_cast<llvm::BranchInst>(&i)) {
+          if (br->isConditional() && state.end() == state.find(br->getCondition())) {
+            boundChecked = true; // continue to the next block, since we have the condition variable's bounds already set
+          }
+        }
+        else {
+          applyTransfer(i, state);
+        }
         results[&i] = state;
       }
+
+// todo: remove
+//      std::cout << "==============" << bb << "==============\n";
+//      for (auto spair: state) {
+//        std::cout << spair.first << " ";
+//        if (spair.second.range) {
+//          std::cout << spair.second.range->first << ":"
+//                  << spair.second.range->second << "\n";
+//        }
+//        else {
+//          std::cout << "undefined\n";
+//        }
+//      }
 
       // If the abstract state for this block did not change, then we are done
       // with this block. Otherwise, we must update the abstract state and
       // consider changes to successors.
-      if (state == oldExitState) {
+      if (state == oldExitState || boundChecked) {
         continue;
       }
 
